@@ -647,25 +647,36 @@ async def poll_civitai_job(token: str, job_id: str) -> dict:
                 f"📊 Attempt {attempt} ({elapsed_time:.1f}s elapsed): Job status = {job_statuses}"
             )
 
+            # Find the specific job we're polling for
+            target_job = None
+            for job in response["jobs"]:
+                if job.get("jobId") == job_id:
+                    target_job = job
+                    break
+
+            if target_job is None:
+                target_job = response["jobs"][-1]
+
+            target_status = target_job.get("status", "unknown")
+
             # Check if job failed
-            for job, job_status in zip(response["jobs"], job_statuses):
-                if job_status in ["Failed", "Cancelled"]:
-                    error_msg = job.get(
-                        "error", "Job failed without specific error message"
+            if target_status in ["Failed", "Cancelled"]:
+                error_msg = target_job.get(
+                    "error", "Job failed without specific error message"
                 )
-                    logger.error(f"❌ Job failed with status {job_status}: {error_msg}")
-                    raise HTTPException(
-                        status_code=500, detail=f"CivitAI job failed: {error_msg}"
-                    )
+                logger.error(f"❌ Job {job_id} failed with status {target_status}: {error_msg}")
+                raise HTTPException(
+                    status_code=500, detail=f"CivitAI job failed: {error_msg}"
+                )
 
             # Check if job is complete
             if (
-                job.get("result")
-                and len(job["result"]) > 0
-                and all([result.get("available") for result in job["result"]])
+                target_job.get("result")
+                and len(target_job["result"]) > 0
+                and all([result.get("available") for result in target_job["result"]])
             ):
                 logger.info(
-                    f"✅ Job completed successfully after {attempt} attempts ({elapsed_time:.1f}s)"
+                    f"✅ Job {job_id} completed successfully after {attempt} attempts ({elapsed_time:.1f}s)"
                 )
                 return response
             else:
@@ -801,18 +812,36 @@ async def create_image(
 
         final_responses = await asyncio.gather(*polling_tasks)
 
-        # Step 4: Translate Civitai responses to OpenAI format in parallel.
-        translation_tasks = [
-            translate_civitai_to_openai(final_res, request, civitai_input)
-            for final_res, civitai_input in zip(final_responses, civitai_inputs)
-        ]
+        # Step 4: Translate Civitai responses to OpenAI format.
+        # With native batching, multiple jobs share one civitai_input.
+        # Each polled response is a snapshot when that specific job completed,
+        # so we merge all job results from across all responses.
+        if not DISABLE_NATIVE_BATCHING and len(final_responses) > len(civitai_inputs):
+            # Merge: build a combined response with results from all polls
+            merged = copy.deepcopy(final_responses[0])
+            jobs_by_id = {}
+            for resp in final_responses:
+                for job in resp.get("jobs", []):
+                    jid = job.get("jobId")
+                    if jid and job.get("result"):
+                        existing = jobs_by_id.get(jid)
+                        if not existing or not all(r.get("available") for r in existing.get("result", [])):
+                            jobs_by_id[jid] = job
+            merged["jobs"] = list(jobs_by_id.values())
+            translation_tasks = [
+                translate_civitai_to_openai(merged, request, civitai_inputs[0])
+            ]
+        else:
+            translation_tasks = [
+                translate_civitai_to_openai(final_res, request, civitai_input)
+                for final_res, civitai_input in zip(final_responses, civitai_inputs)
+            ]
         openai_responses = await asyncio.gather(*translation_tasks)
 
         # Combine all image data into single response
         all_image_data: List[Image] = [
             data for res in openai_responses for data in res.data
         ]
-
 
         return ImagesResponse(created=openai_responses[0].created, data=all_image_data)
 
