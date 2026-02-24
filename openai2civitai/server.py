@@ -309,6 +309,29 @@ async def verbose_logging_middleware(request: Request, call_next):
     return response
 
 
+@app.get("/v1/models")
+async def list_models() -> dict:
+    """List available models in OpenAI-compatible format so Open-WebUI can discover them."""
+    default_model = prompt_parser.CIVITAI_DEFAULT_MODEL
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": default_model,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "civitai",
+            },
+            {
+                "id": "dall-e-3",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "civitai",
+            },
+        ],
+    }
+
+
 @app.get("/health")
 async def health_check() -> dict:
     """Health check endpoint."""
